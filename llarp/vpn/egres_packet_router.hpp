@@ -17,7 +17,7 @@ namespace llarp::vpn
     virtual void
     HandleIPPacketFrom(AddressVariant_t from, net::IPPacket pkt) = 0;
 
-    virtual void AddSubHandler(nuint16_t, EgresPacketHandlerFunc){};
+    virtual bool AddSubHandler(nuint16_t, EgresPacketHandlerFunc){ return false; };
     virtual void RemoveSubHandler(nuint16_t){};
   };
 
@@ -39,7 +39,7 @@ namespace llarp::vpn
     AddIProtoHandler(uint8_t proto, EgresPacketHandlerFunc func);
 
     /// helper that adds a udp packet handler for UDP destinted for localport
-    void
+    bool
     AddUDPHandler(huint16_t localport, EgresPacketHandlerFunc func);
 
     /// remove a udp handler that is already set up by bound port

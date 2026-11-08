@@ -11,10 +11,10 @@ namespace llarp::vpn
         : m_BaseHandler{std::move(baseHandler)}
     {}
 
-    void
+    bool
     AddSubHandler(nuint16_t localport, EgresPacketHandlerFunc handler) override
     {
-      m_LocalPorts.emplace(std::move(localport), std::move(handler));
+      return m_LocalPorts.emplace(std::move(localport), std::move(handler)).second;
     }
 
     void
@@ -74,14 +74,14 @@ namespace llarp::vpn
     constexpr byte_t udp_proto = 0x11;
   }
 
-  void
+  bool
   EgresPacketRouter::AddUDPHandler(huint16_t localport, EgresPacketHandlerFunc func)
   {
     if (m_IPProtoHandler.find(udp_proto) == m_IPProtoHandler.end())
     {
       m_IPProtoHandler.emplace(udp_proto, std::make_unique<EgresUDPPacketHandler>(m_BaseHandler));
     }
-    m_IPProtoHandler[udp_proto]->AddSubHandler(ToNet(localport), std::move(func));
+    return m_IPProtoHandler[udp_proto]->AddSubHandler(ToNet(localport), std::move(func));
   }
 
   void

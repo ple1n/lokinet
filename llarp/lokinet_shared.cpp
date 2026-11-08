@@ -5,6 +5,7 @@
 
 #include <llarp/router/abstractrouter.hpp>
 #include <llarp/service/context.hpp>
+#include <llarp/service/name.hpp>
 #include <llarp/quic/tunnel.hpp>
 #include <llarp/nodedb.hpp>
 
@@ -14,6 +15,10 @@
 
 #include <oxenc/base32z.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <future>
 #include <mutex>
 #include <memory>
 #include <chrono>
@@ -27,6 +32,15 @@
 
 namespace
 {
+  std::string
+  lowercase_ascii(std::string value)
+  {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+  }
+
   struct Context : public llarp::Context
   {
     using llarp::Context::Context;
@@ -92,6 +106,7 @@ namespace
     std::weak_ptr<llarp::service::Endpoint> m_Endpoint;
 
     std::unordered_map<AddressVariant_t, UDPFlow> m_Flows;
+    std::unordered_map<std::string, AddressVariant_t> m_RemoteAddresses;
 
     std::mutex m_Access;
 
@@ -121,24 +136,30 @@ namespace
         item.second.TimedOut(m_Timeout);
       }
       m_Flows.clear();
+      m_RemoteAddresses.clear();
     }
 
-    void
+    bool
     AddFlow(
         const AddressVariant_t& from,
         const lokinet_udp_flowinfo& flow_addr,
         void* flow_userdata,
         int flow_timeoutseconds,
-        std::optional<llarp::net::IPPacket> firstPacket = std::nullopt)
+        std::optional<llarp::net::IPPacket> firstPacket = std::nullopt,
+        bool rejectDuplicate = false)
     {
       std::unique_lock lock{m_Access};
-      auto& flow = m_Flows[from];
+      auto [itr, inserted] = m_Flows.try_emplace(from);
+      if (rejectDuplicate and not inserted)
+        return false;
+      auto& flow = itr->second;
       flow.m_FlowInfo = flow_addr;
       flow.m_FlowTimeout = std::chrono::seconds{flow_timeoutseconds};
       flow.m_FlowUserData = flow_userdata;
       flow.m_Recv = m_Recv;
       if (firstPacket)
         flow.HandlePacket(*firstPacket);
+      return true;
     }
 
     void
@@ -150,6 +171,7 @@ namespace
         if (itr->second.IsExpired())
         {
           itr->second.TimedOut(m_Timeout);
+          m_RemoteAddresses.erase(lowercase_ascii(itr->second.m_FlowInfo.remote_host));
           itr = m_Flows.erase(itr);
         }
         else
@@ -256,10 +278,10 @@ struct lokinet_context
     impl->router->loop()->call([ep, &result, udp, exposePort]() {
       if (auto pkt = ep->EgresPacketRouter())
       {
-        pkt->AddUDPHandler(llarp::net::ToHost(exposePort), [udp](auto from, auto pkt) {
-          udp->HandlePacketFrom(std::move(from), std::move(pkt));
-        });
-        result.set_value(true);
+        result.set_value(pkt->AddUDPHandler(
+            llarp::net::ToHost(exposePort), [udp](auto from, auto pkt) {
+              udp->HandlePacketFrom(std::move(from), std::move(pkt));
+            }));
       }
       else
         result.set_value(false);
@@ -287,13 +309,26 @@ struct lokinet_context
     }
     if (udp)
     {
-      udp->KillAllFlows();
-      // remove packet handler
-      impl->router->loop()->call(
-          [ep = udp->m_Endpoint.lock(), localport = llarp::ToHost(udp->m_LocalPort)]() {
-            if (auto pkt = ep->EgresPacketRouter())
-              pkt->RemoveUDPHandler(localport);
-          });
+      auto remove = [udp]() {
+        udp->KillAllFlows();
+        if (auto ep = udp->m_Endpoint.lock())
+        {
+          if (auto pkt = ep->EgresPacketRouter())
+            pkt->RemoveUDPHandler(llarp::ToHost(udp->m_LocalPort));
+        }
+      };
+      auto loop = impl->router->loop();
+      if (loop->inEventLoop())
+        remove();
+      else
+      {
+        std::promise<void> removed;
+        loop->call([remove = std::move(remove), &removed]() mutable {
+          remove();
+          removed.set_value();
+        });
+        removed.get_future().wait();
+      }
     }
   }
 
@@ -655,18 +690,20 @@ extern "C"
   {
     if (not ctx)
       return;
-    auto lock = ctx->acquire();
-
-    if (ctx->impl->IsStopping())
-      return;
-
-    ctx->impl->CloseAsync();
-    ctx->impl->Wait();
-
-    if (ctx->runner)
-      ctx->runner->join();
-
-    ctx->runner.reset();
+    std::shared_ptr<llarp::Context> impl;
+    std::unique_ptr<std::thread> runner;
+    {
+      auto lock = ctx->acquire();
+      if (not ctx->runner)
+        return;
+      if (not ctx->impl->IsStopping())
+        ctx->impl->CloseAsync();
+      impl = ctx->impl;
+      runner = std::move(ctx->runner);
+    }
+    impl->Wait();
+    if (runner->joinable())
+      runner->join();
   }
 
   void EXPORT
@@ -983,18 +1020,25 @@ extern "C"
       return EINVAL;
     std::shared_ptr<llarp::EndpointBase> ep;
     llarp::nuint16_t srcport{0};
+    auto remote_host = lowercase_ascii(remote->remote_host);
     auto dstport = llarp::net::port_t::from_host(remote->remote_port);
+    std::optional<llarp::EndpointBase::AddressVariant_t> remote_address;
     {
       auto lock = ctx->acquire();
       if (auto itr = ctx->udp_sockets.find(remote->socket_id); itr != ctx->udp_sockets.end())
       {
         ep = itr->second->m_Endpoint.lock();
         srcport = itr->second->m_LocalPort;
+        if (auto parsed = llarp::service::ParseAddress(remote_host))
+          remote_address = *parsed;
+        else if (auto resolved = itr->second->m_RemoteAddresses.find(remote_host);
+                 resolved != itr->second->m_RemoteAddresses.end())
+          remote_address = resolved->second;
       }
       else
         return EHOSTUNREACH;
     }
-    if (auto maybe = llarp::service::ParseAddress(std::string{remote->remote_host}))
+    if (remote_address)
     {
       llarp::net::IPPacket pkt = llarp::net::IPPacket::UDP(
           llarp::nuint32_t{0},
@@ -1006,7 +1050,8 @@ extern "C"
       if (pkt.empty())
         return EINVAL;
       std::promise<int> ret;
-      ctx->impl->router->loop()->call([addr = *maybe, pkt = std::move(pkt), ep, &ret]() {
+      ctx->impl->router->loop()->call(
+          [addr = *remote_address, pkt = std::move(pkt), ep, &ret]() {
         if (auto tag = ep->GetBestConvoTagFor(addr))
         {
           if (ep->SendToOrQueue(*tag, pkt.ConstBuffer(), llarp::service::ProtocolType::TrafficV4))
@@ -1046,50 +1091,64 @@ extern "C"
       else
         return EHOSTUNREACH;
     }
-    if (auto maybe = llarp::service::ParseAddress(std::string{remote->remote_host}))
+    const auto remote_host = lowercase_ascii(remote->remote_host);
+    auto address = llarp::service::ParseAddress(remote_host);
+    if (not address and llarp::service::NameIsValid(remote_host))
     {
-      {
-        // check for pre existing flow
-        auto lock = ctx->acquire();
-        if (auto itr = ctx->udp_sockets.find(remote->socket_id); itr != ctx->udp_sockets.end())
-        {
-          auto& udp = itr->second;
-          if (udp->m_Flows.count(*maybe))
-          {
-            // we already have a flow.
-            return EADDRINUSE;
-          }
-        }
-      }
-      std::promise<bool> gotten;
-      ctx->impl->router->loop()->call([addr = *maybe, ep, &gotten]() {
-        ep->MarkAddressOutbound(addr);
-        auto res = ep->EnsurePathTo(
-            addr, [&gotten](auto result) { gotten.set_value(result.has_value()); }, 5s);
-        if (not res)
-        {
-          gotten.set_value(false);
-        }
+      using AddressVariant = llarp::EndpointBase::AddressVariant_t;
+      auto lookup = std::make_shared<std::promise<std::optional<AddressVariant>>>();
+      auto lookup_result = lookup->get_future();
+      ctx->impl->router->loop()->call([ep, remote_host, lookup]() {
+        ep->LookupNameAsync(remote_host, [lookup](auto result) {
+          lookup->set_value(std::move(result));
+        });
       });
-      if (gotten.get_future().get())
-      {
-        void* flow_data{nullptr};
-        int flow_timeoutseconds{};
-        create_flow(user, &flow_data, &flow_timeoutseconds);
-        {
-          auto lock = ctx->acquire();
-          if (auto itr = ctx->udp_sockets.find(remote->socket_id); itr != ctx->udp_sockets.end())
-          {
-            itr->second->AddFlow(*maybe, *remote, flow_data, flow_timeoutseconds);
-            return 0;
-          }
-          return EADDRINUSE;
-        }
-      }
-      else
+      if (lookup_result.wait_for(30s) != std::future_status::ready)
         return ETIMEDOUT;
+      address = lookup_result.get();
     }
-    return EINVAL;
+
+    if (not address)
+      return EINVAL;
+
+    using AddressVariant = llarp::EndpointBase::AddressVariant_t;
+    const AddressVariant remote_address = *address;
+    auto path_ready = std::make_shared<std::promise<bool>>();
+    auto path_completed = std::make_shared<std::atomic_bool>(false);
+    auto complete_path = [path_ready, path_completed](bool success) {
+      if (not path_completed->exchange(true))
+        path_ready->set_value(success);
+    };
+    auto path_result = path_ready->get_future();
+    ctx->impl->router->loop()->call([ep, remote_address, complete_path]() {
+      ep->MarkAddressOutbound(remote_address);
+      auto started = ep->EnsurePathTo(
+          remote_address,
+          [complete_path](auto result) { complete_path(result.has_value()); },
+          5s);
+      if (not started)
+        complete_path(false);
+    });
+    if (path_result.wait_for(7s) != std::future_status::ready or not path_result.get())
+      return ETIMEDOUT;
+
+    void* flow_data{nullptr};
+    int flow_timeoutseconds{};
+    create_flow(user, &flow_data, &flow_timeoutseconds);
+    {
+      auto lock = ctx->acquire();
+      if (auto itr = ctx->udp_sockets.find(remote->socket_id); itr != ctx->udp_sockets.end())
+      {
+        auto& udp = itr->second;
+        if (udp->m_RemoteAddresses.count(remote_host))
+          return EADDRINUSE;
+        if (not udp->AddFlow(remote_address, *remote, flow_data, flow_timeoutseconds, std::nullopt, true))
+          return EADDRINUSE;
+        udp->m_RemoteAddresses.emplace(remote_host, remote_address);
+        return 0;
+      }
+    }
+    return EHOSTUNREACH;
   }
 
   void EXPORT

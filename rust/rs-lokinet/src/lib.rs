@@ -1,12 +1,10 @@
-use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 unsafe extern "C" {
     fn lokinet_context_new() -> *mut RawLokinet;
@@ -191,10 +189,23 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-pub struct Runtime {
+struct ContextInner {
     raw: NonNull<RawLokinet>,
-    retired_udp_callbacks: RefCell<Vec<Box<UdpCallbacks>>>,
-    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+// The native context serializes public API access internally and is freed only
+// after its last Rust owner and every stream/socket handle have been dropped.
+unsafe impl Send for ContextInner {}
+unsafe impl Sync for ContextInner {}
+
+impl Drop for ContextInner {
+    fn drop(&mut self) {
+        unsafe { lokinet_context_free(self.raw.as_ptr()) };
+    }
+}
+
+pub struct Runtime {
+    inner: Arc<ContextInner>,
 }
 
 impl Runtime {
@@ -208,10 +219,8 @@ impl Runtime {
         let data_dir = CString::new(data_dir).map_err(|_| Error::InvalidString)?;
 
         let raw = NonNull::new(unsafe { lokinet_context_new() }).ok_or(Error::NullHandle)?;
-        let mut runtime = Self {
-            raw,
-            retired_udp_callbacks: RefCell::new(Vec::new()),
-            _not_send_or_sync: PhantomData,
+        let runtime = Self {
+            inner: Arc::new(ContextInner { raw }),
         };
         let mut error_buffer = [0 as c_char; 1024];
         let result = unsafe {
@@ -220,7 +229,7 @@ impl Runtime {
                 data_dir.as_ptr(),
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
-                runtime.raw.as_ptr(),
+                runtime.inner.raw.as_ptr(),
             )
         };
         if result != 0 {
@@ -230,7 +239,7 @@ impl Runtime {
             return Err(Error::Native(message));
         }
 
-        if unsafe { lokinet_context_start(runtime.raw.as_ptr()) } != 0 {
+        if unsafe { lokinet_context_start(runtime.inner.raw.as_ptr()) } != 0 {
             return Err(Error::Native(
                 "failed to start the Lokinet context".to_owned(),
             ));
@@ -239,7 +248,7 @@ impl Runtime {
     }
 
     pub fn is_connected(&self) -> bool {
-        unsafe { lokinet_status(self.raw.as_ptr()) == 0 }
+        unsafe { lokinet_status(self.inner.raw.as_ptr()) == 0 }
     }
 
     pub fn bind_udp<F, R, T>(
@@ -248,7 +257,7 @@ impl Runtime {
         filter: F,
         receive: R,
         timeout: T,
-    ) -> Result<UdpSocket<'_>, Error>
+    ) -> Result<UdpSocket, Error>
     where
         F: Fn(&UdpFlow) -> Option<NonZeroU32> + Send + Sync + 'static,
         R: Fn(UdpFlow, Vec<u8>) + Send + Sync + 'static,
@@ -269,7 +278,7 @@ impl Runtime {
                 udp_timeout_callback,
                 userdata,
                 &mut result,
-                self.raw.as_ptr(),
+                self.inner.raw.as_ptr(),
             )
         };
         if code != 0 {
@@ -279,17 +288,15 @@ impl Runtime {
             });
         }
         Ok(UdpSocket {
-            runtime: self,
-            socket_id: result.socket_id,
-            callbacks: Some(callbacks),
+            inner: Arc::new(UdpSocketInner {
+                context: Arc::clone(&self.inner),
+                socket_id: result.socket_id,
+                callbacks: Mutex::new(Some(callbacks)),
+            }),
         })
     }
 
-    pub fn open_tcp_stream(
-        &self,
-        remote: &str,
-        local: Option<&str>,
-    ) -> Result<TcpStream<'_>, Error> {
+    pub fn open_tcp_stream(&self, remote: &str, local: Option<&str>) -> Result<TcpStream, Error> {
         let remote = CString::new(remote).map_err(|_| Error::InvalidString)?;
         let local = local
             .map(CString::new)
@@ -308,7 +315,7 @@ impl Runtime {
                 local
                     .as_ref()
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
-                self.raw.as_ptr(),
+                self.inner.raw.as_ptr(),
             )
         };
         if result.error != 0 {
@@ -320,25 +327,27 @@ impl Runtime {
         let Some(local_address) =
             decode_fixed_string(&result.local_address).filter(|address| !address.is_empty())
         else {
-            unsafe { lokinet_close_stream(result.stream_id, self.raw.as_ptr()) };
+            unsafe { lokinet_close_stream(result.stream_id, self.inner.raw.as_ptr()) };
             return Err(Error::InvalidStreamResult);
         };
         let Some(local_port) = u16::try_from(result.local_port)
             .ok()
             .filter(|port| *port != 0)
         else {
-            unsafe { lokinet_close_stream(result.stream_id, self.raw.as_ptr()) };
+            unsafe { lokinet_close_stream(result.stream_id, self.inner.raw.as_ptr()) };
             return Err(Error::InvalidStreamResult);
         };
         Ok(TcpStream {
-            runtime: self,
-            stream_id: result.stream_id,
-            local_address,
-            local_port,
+            inner: Arc::new(TcpStreamInner {
+                context: Arc::clone(&self.inner),
+                stream_id: result.stream_id,
+                local_address,
+                local_port,
+            }),
         })
     }
 
-    pub fn listen_tcp_stream<F>(&self, filter: F) -> Result<TcpListener<'_>, Error>
+    pub fn listen_tcp_stream<F>(&self, filter: F) -> Result<TcpListener, Error>
     where
         F: Fn(&str, u16) -> StreamDecision + Send + Sync + 'static,
     {
@@ -347,7 +356,7 @@ impl Runtime {
         });
         let userdata = (&mut *callback as *mut StreamFilterData).cast::<c_void>();
         let stream_id = unsafe {
-            lokinet_inbound_stream_filter(stream_filter_callback, userdata, self.raw.as_ptr())
+            lokinet_inbound_stream_filter(stream_filter_callback, userdata, self.inner.raw.as_ptr())
         };
         if stream_id < 0 {
             return Err(Error::NativeCall {
@@ -356,16 +365,12 @@ impl Runtime {
             });
         }
         Ok(TcpListener {
-            runtime: self,
-            stream_id,
-            callback: Some(callback),
+            inner: Arc::new(TcpListenerInner {
+                context: Arc::clone(&self.inner),
+                stream_id,
+                callback: Mutex::new(Some(callback)),
+            }),
         })
-    }
-}
-
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        unsafe { lokinet_context_free(self.raw.as_ptr()) };
     }
 }
 
@@ -392,13 +397,30 @@ struct UdpCallbacks {
     timeout: Box<dyn Fn(UdpFlow) + Send + Sync>,
 }
 
-pub struct UdpSocket<'runtime> {
-    runtime: &'runtime Runtime,
+struct UdpSocketInner {
+    context: Arc<ContextInner>,
     socket_id: c_int,
-    callbacks: Option<Box<UdpCallbacks>>,
+    callbacks: Mutex<Option<Box<UdpCallbacks>>>,
 }
 
-impl UdpSocket<'_> {
+impl Drop for UdpSocketInner {
+    fn drop(&mut self) {
+        unsafe { lokinet_udp_close(self.socket_id, self.context.raw.as_ptr()) };
+        drop(
+            self.callbacks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+    }
+}
+
+#[derive(Clone)]
+pub struct UdpSocket {
+    inner: Arc<UdpSocketInner>,
+}
+
+impl UdpSocket {
     pub fn establish(
         &self,
         remote_host: &str,
@@ -407,9 +429,13 @@ impl UdpSocket<'_> {
     ) -> Result<UdpFlow, Error> {
         let timeout_seconds =
             c_int::try_from(timeout_seconds.get()).map_err(|_| Error::TimeoutOutOfRange)?;
-        let flow = encode_udp_flow(remote_host, remote_port, self.socket_id)?;
-        let callback_data = self
+        let flow = encode_udp_flow(remote_host, remote_port, self.inner.socket_id)?;
+        let callbacks = self
+            .inner
             .callbacks
+            .lock()
+            .map_err(|_| Error::Native("UDP callback storage is poisoned".to_owned()))?;
+        let callback_data = callbacks
             .as_ref()
             .expect("UDP callback data remains alive until the socket is closed");
         let mut request = OutboundFlowRequest {
@@ -421,7 +447,7 @@ impl UdpSocket<'_> {
                 udp_create_flow_callback,
                 (&mut request as *mut OutboundFlowRequest).cast(),
                 &flow,
-                self.runtime.raw.as_ptr(),
+                self.inner.context.raw.as_ptr(),
             )
         };
         if code != 0 {
@@ -434,7 +460,7 @@ impl UdpSocket<'_> {
     }
 
     pub fn send(&self, flow: &UdpFlow, data: &[u8]) -> Result<(), Error> {
-        if data.is_empty() || flow.socket_id != self.socket_id {
+        if data.is_empty() || flow.socket_id != self.inner.socket_id {
             return Err(Error::InvalidUdpFlow);
         }
         let raw_flow = encode_udp_flow(&flow.remote_host, flow.remote_port, flow.socket_id)?;
@@ -443,7 +469,7 @@ impl UdpSocket<'_> {
                 &raw_flow,
                 data.as_ptr().cast(),
                 data.len(),
-                self.runtime.raw.as_ptr(),
+                self.inner.context.raw.as_ptr(),
             )
         };
         if code != 0 {
@@ -453,18 +479,6 @@ impl UdpSocket<'_> {
             });
         }
         Ok(())
-    }
-}
-
-impl Drop for UdpSocket<'_> {
-    fn drop(&mut self) {
-        unsafe { lokinet_udp_close(self.socket_id, self.runtime.raw.as_ptr()) };
-        if let Some(callbacks) = self.callbacks.take() {
-            self.runtime
-                .retired_udp_callbacks
-                .borrow_mut()
-                .push(callbacks);
-        }
     }
 }
 
@@ -618,49 +632,62 @@ struct StreamFilterData {
     filter: Box<StreamFilter>,
 }
 
-pub struct TcpStream<'runtime> {
-    runtime: &'runtime Runtime,
+struct TcpStreamInner {
+    context: Arc<ContextInner>,
     stream_id: c_int,
     local_address: String,
     local_port: u16,
 }
 
-impl TcpStream<'_> {
+impl Drop for TcpStreamInner {
+    fn drop(&mut self) {
+        unsafe { lokinet_close_stream(self.stream_id, self.context.raw.as_ptr()) };
+    }
+}
+
+#[derive(Clone)]
+pub struct TcpStream {
+    inner: Arc<TcpStreamInner>,
+}
+
+impl TcpStream {
     pub fn local_address(&self) -> &str {
-        &self.local_address
+        &self.inner.local_address
     }
 
     pub fn local_port(&self) -> u16 {
-        self.local_port
+        self.inner.local_port
     }
 
     pub fn stream_id(&self) -> c_int {
-        self.stream_id
+        self.inner.stream_id
     }
 }
 
-impl Drop for TcpStream<'_> {
-    fn drop(&mut self) {
-        unsafe { lokinet_close_stream(self.stream_id, self.runtime.raw.as_ptr()) };
-    }
-}
-
-pub struct TcpListener<'runtime> {
-    runtime: &'runtime Runtime,
+struct TcpListenerInner {
+    context: Arc<ContextInner>,
     stream_id: c_int,
-    callback: Option<Box<StreamFilterData>>,
+    callback: Mutex<Option<Box<StreamFilterData>>>,
 }
 
-impl TcpListener<'_> {
-    pub fn stream_id(&self) -> c_int {
-        self.stream_id
+impl Drop for TcpListenerInner {
+    fn drop(&mut self) {
+        unsafe { lokinet_close_stream(self.stream_id, self.context.raw.as_ptr()) };
+        self.callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 }
 
-impl Drop for TcpListener<'_> {
-    fn drop(&mut self) {
-        unsafe { lokinet_close_stream(self.stream_id, self.runtime.raw.as_ptr()) };
-        self.callback.take();
+#[derive(Clone)]
+pub struct TcpListener {
+    inner: Arc<TcpListenerInner>,
+}
+
+impl TcpListener {
+    pub fn stream_id(&self) -> c_int {
+        self.inner.stream_id
     }
 }
 
@@ -689,6 +716,16 @@ unsafe extern "C" fn stream_filter_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn runtime_and_handles_are_send_and_sync() {
+        assert_send_sync::<Runtime>();
+        assert_send_sync::<UdpSocket>();
+        assert_send_sync::<TcpStream>();
+        assert_send_sync::<TcpListener>();
+    }
 
     #[test]
     fn rejects_relative_state_directory() {
