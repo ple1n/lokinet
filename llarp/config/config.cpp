@@ -1643,9 +1643,9 @@ namespace llarp
   }
 
   std::shared_ptr<Config>
-  Config::EmbeddedConfig()
+  Config::EmbeddedConfig(std::optional<fs::path> datadir)
   {
-    auto config = std::make_shared<Config>();
+    auto config = std::make_shared<Config>(std::move(datadir));
     config->Load();
     config->logging.m_logLevel = log::Level::off;
     config->api.m_enableRPCServer = false;

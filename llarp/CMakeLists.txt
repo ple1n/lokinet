@@ -314,6 +314,16 @@ if(BUILD_LIBLOKINET)
   elseif(NOT APPLE)
     install(TARGETS lokinet-shared LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT liblokinet)
   endif()
+  configure_file(
+    "${PROJECT_SOURCE_DIR}/cmake/lokinet-embedded.pc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/lokinet-embedded.pc"
+    @ONLY)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/lokinet-embedded.pc"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+  install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/lokinet"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  install(FILES "${PROJECT_SOURCE_DIR}/include/lokinet.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 endif()
 
 if(APPLE)

@@ -281,7 +281,7 @@ namespace llarp
 
     /// create a config with the default parameters for an embedded lokinet
     static std::shared_ptr<Config>
-    EmbeddedConfig();
+    EmbeddedConfig(std::optional<fs::path> datadir = std::nullopt);
 
    private:
     /// Load (initialize) a default config.

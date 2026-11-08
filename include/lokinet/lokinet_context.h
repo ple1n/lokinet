@@ -17,6 +17,17 @@ extern "C"
   struct lokinet_context* EXPORT
   lokinet_context_new();
 
+  /// replace the context config before it is started
+  /// config is INI text and data_dir must be an absolute path
+  /// return 0 on success, otherwise an errno value
+  int EXPORT
+  lokinet_context_set_config(
+      const char* config,
+      const char* data_dir,
+      char* error_buffer,
+      size_t error_buffer_size,
+      struct lokinet_context* ctx);
+
   /// free a context allocated by lokinet_context_new
   void EXPORT
   lokinet_context_free(struct lokinet_context*);

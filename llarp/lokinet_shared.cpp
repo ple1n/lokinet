@@ -17,6 +17,8 @@
 #include <mutex>
 #include <memory>
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -523,6 +525,53 @@ extern "C"
   lokinet_context_new()
   {
     return new lokinet_context{};
+  }
+
+  int EXPORT
+  lokinet_context_set_config(
+      const char* config_text,
+      const char* data_dir,
+      char* error_buffer,
+      size_t error_buffer_size,
+      struct lokinet_context* ctx)
+  {
+    auto fail = [error_buffer, error_buffer_size](int error, const char* message) {
+      if (error_buffer && error_buffer_size)
+        std::snprintf(error_buffer, error_buffer_size, "%s", message);
+      return error;
+    };
+
+    if (!ctx || !config_text || !data_dir)
+      return fail(EINVAL, "config text, data directory, and context are required");
+
+    auto lock = ctx->acquire();
+    if (ctx->runner)
+      return fail(EBUSY, "Lokinet context has already been started");
+
+    try
+    {
+      const std::filesystem::path data_path{data_dir};
+      if (!data_path.is_absolute())
+        return fail(EINVAL, "Lokinet data directory must be absolute");
+
+      auto config = llarp::Config::EmbeddedConfig(data_path);
+      if (!config->LoadString(config_text))
+        return fail(EINVAL, "failed to parse Lokinet configuration");
+
+      config->logging.m_logLevel = llarp::log::Level::off;
+      config->api.m_enableRPCServer = false;
+      config->network.m_endpointType = "null";
+      config->network.m_saveProfiles = false;
+      config->bootstrap.files.clear();
+      ctx->config = std::move(config);
+      if (error_buffer && error_buffer_size)
+        error_buffer[0] = '\0';
+      return 0;
+    }
+    catch (const std::exception& e)
+    {
+      return fail(EINVAL, e.what());
+    }
   }
 
   void EXPORT
