@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::marker::PhantomData;
-use std::os::raw::{c_char, c_int};
+use std::num::NonZeroU32;
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -18,11 +20,83 @@ unsafe extern "C" {
     fn lokinet_context_start(context: *mut RawLokinet) -> c_int;
     fn lokinet_status(context: *mut RawLokinet) -> c_int;
     fn lokinet_context_free(context: *mut RawLokinet);
+    fn lokinet_udp_bind(
+        exposed_port: u16,
+        filter: unsafe extern "C" fn(
+            userdata: *mut c_void,
+            remote: *const RawUdpFlowInfo,
+            flow_userdata: *mut *mut c_void,
+            timeout_seconds: *mut c_int,
+        ) -> c_int,
+        recv: unsafe extern "C" fn(
+            remote: *const RawUdpFlowInfo,
+            data: *const c_char,
+            length: usize,
+            flow_userdata: *mut c_void,
+        ),
+        timeout: unsafe extern "C" fn(remote: *const RawUdpFlowInfo, flow_userdata: *mut c_void),
+        userdata: *mut c_void,
+        result: *mut RawUdpBindResult,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_udp_establish(
+        create_flow: unsafe extern "C" fn(
+            userdata: *mut c_void,
+            flow_userdata: *mut *mut c_void,
+            timeout_seconds: *mut c_int,
+        ),
+        userdata: *mut c_void,
+        remote: *const RawUdpFlowInfo,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_udp_flow_send(
+        remote: *const RawUdpFlowInfo,
+        data: *const c_void,
+        length: usize,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_udp_close(socket_id: c_int, context: *mut RawLokinet);
+    fn lokinet_outbound_stream(
+        result: *mut RawStreamResult,
+        remote: *const c_char,
+        local: *const c_char,
+        context: *mut RawLokinet,
+    );
+    fn lokinet_inbound_stream_filter(
+        filter: unsafe extern "C" fn(
+            remote: *const c_char,
+            port: u16,
+            userdata: *mut c_void,
+        ) -> c_int,
+        userdata: *mut c_void,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_close_stream(stream_id: c_int, context: *mut RawLokinet);
 }
 
 #[repr(C)]
 struct RawLokinet {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+struct RawUdpFlowInfo {
+    remote_host: [c_char; 256],
+    remote_port: u16,
+    socket_id: c_int,
+}
+
+#[repr(C)]
+struct RawUdpBindResult {
+    socket_id: c_int,
+}
+
+#[repr(C)]
+struct RawStreamResult {
+    error: c_int,
+    local_address: [c_char; 256],
+    local_port: c_int,
+    stream_id: c_int,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,10 +146,17 @@ impl ValidatedConfig {
 #[derive(Debug)]
 pub enum Error {
     DataDirectoryMustBeAbsolute(PathBuf),
+    InvalidStreamResult,
     InvalidString,
+    InvalidUdpFlow,
     Native(String),
+    NativeCall {
+        operation: &'static str,
+        code: c_int,
+    },
     NullHandle,
     NonUtf8Path(PathBuf),
+    TimeoutOutOfRange,
 }
 
 impl fmt::Display for Error {
@@ -88,8 +169,13 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
+            Self::InvalidStreamResult => write!(f, "Lokinet returned an invalid TCP stream result"),
             Self::InvalidString => write!(f, "Lokinet config contains an interior NUL"),
+            Self::InvalidUdpFlow => write!(f, "invalid Lokinet UDP flow"),
             Self::Native(message) => write!(f, "Lokinet initialization failed: {message}"),
+            Self::NativeCall { operation, code } => {
+                write!(f, "Lokinet {operation} failed with error {code}")
+            }
             Self::NullHandle => write!(f, "Lokinet returned a null handle"),
             Self::NonUtf8Path(path) => {
                 write!(
@@ -98,6 +184,7 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
+            Self::TimeoutOutOfRange => write!(f, "Lokinet UDP flow timeout is out of range"),
         }
     }
 }
@@ -106,6 +193,7 @@ impl std::error::Error for Error {}
 
 pub struct Runtime {
     raw: NonNull<RawLokinet>,
+    retired_udp_callbacks: RefCell<Vec<Box<UdpCallbacks>>>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -122,6 +210,7 @@ impl Runtime {
         let raw = NonNull::new(unsafe { lokinet_context_new() }).ok_or(Error::NullHandle)?;
         let mut runtime = Self {
             raw,
+            retired_udp_callbacks: RefCell::new(Vec::new()),
             _not_send_or_sync: PhantomData,
         };
         let mut error_buffer = [0 as c_char; 1024];
@@ -152,12 +241,449 @@ impl Runtime {
     pub fn is_connected(&self) -> bool {
         unsafe { lokinet_status(self.raw.as_ptr()) == 0 }
     }
+
+    pub fn bind_udp<F, R, T>(
+        &self,
+        exposed_port: u16,
+        filter: F,
+        receive: R,
+        timeout: T,
+    ) -> Result<UdpSocket<'_>, Error>
+    where
+        F: Fn(&UdpFlow) -> Option<NonZeroU32> + Send + Sync + 'static,
+        R: Fn(UdpFlow, Vec<u8>) + Send + Sync + 'static,
+        T: Fn(UdpFlow) + Send + Sync + 'static,
+    {
+        let mut callbacks = Box::new(UdpCallbacks {
+            filter: Box::new(filter),
+            receive: Box::new(receive),
+            timeout: Box::new(timeout),
+        });
+        let userdata = (&mut *callbacks as *mut UdpCallbacks).cast::<c_void>();
+        let mut result = RawUdpBindResult { socket_id: 0 };
+        let code = unsafe {
+            lokinet_udp_bind(
+                exposed_port,
+                udp_filter_callback,
+                udp_receive_callback,
+                udp_timeout_callback,
+                userdata,
+                &mut result,
+                self.raw.as_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(Error::NativeCall {
+                operation: "UDP bind",
+                code,
+            });
+        }
+        Ok(UdpSocket {
+            runtime: self,
+            socket_id: result.socket_id,
+            callbacks: Some(callbacks),
+        })
+    }
+
+    pub fn open_tcp_stream(
+        &self,
+        remote: &str,
+        local: Option<&str>,
+    ) -> Result<TcpStream<'_>, Error> {
+        let remote = CString::new(remote).map_err(|_| Error::InvalidString)?;
+        let local = local
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| Error::InvalidString)?;
+        let mut result = RawStreamResult {
+            error: 0,
+            local_address: [0; 256],
+            local_port: 0,
+            stream_id: 0,
+        };
+        unsafe {
+            lokinet_outbound_stream(
+                &mut result,
+                remote.as_ptr(),
+                local
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                self.raw.as_ptr(),
+            )
+        };
+        if result.error != 0 {
+            return Err(Error::NativeCall {
+                operation: "outbound TCP stream",
+                code: result.error,
+            });
+        }
+        let Some(local_address) =
+            decode_fixed_string(&result.local_address).filter(|address| !address.is_empty())
+        else {
+            unsafe { lokinet_close_stream(result.stream_id, self.raw.as_ptr()) };
+            return Err(Error::InvalidStreamResult);
+        };
+        let Some(local_port) = u16::try_from(result.local_port)
+            .ok()
+            .filter(|port| *port != 0)
+        else {
+            unsafe { lokinet_close_stream(result.stream_id, self.raw.as_ptr()) };
+            return Err(Error::InvalidStreamResult);
+        };
+        Ok(TcpStream {
+            runtime: self,
+            stream_id: result.stream_id,
+            local_address,
+            local_port,
+        })
+    }
+
+    pub fn listen_tcp_stream<F>(&self, filter: F) -> Result<TcpListener<'_>, Error>
+    where
+        F: Fn(&str, u16) -> StreamDecision + Send + Sync + 'static,
+    {
+        let mut callback = Box::new(StreamFilterData {
+            filter: Box::new(filter),
+        });
+        let userdata = (&mut *callback as *mut StreamFilterData).cast::<c_void>();
+        let stream_id = unsafe {
+            lokinet_inbound_stream_filter(stream_filter_callback, userdata, self.raw.as_ptr())
+        };
+        if stream_id < 0 {
+            return Err(Error::NativeCall {
+                operation: "inbound TCP listener",
+                code: stream_id,
+            });
+        }
+        Ok(TcpListener {
+            runtime: self,
+            stream_id,
+            callback: Some(callback),
+        })
+    }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         unsafe { lokinet_context_free(self.raw.as_ptr()) };
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpFlow {
+    remote_host: String,
+    remote_port: u16,
+    socket_id: c_int,
+}
+
+impl UdpFlow {
+    pub fn remote_host(&self) -> &str {
+        &self.remote_host
+    }
+
+    pub fn remote_port(&self) -> u16 {
+        self.remote_port
+    }
+}
+
+struct UdpCallbacks {
+    filter: Box<dyn Fn(&UdpFlow) -> Option<NonZeroU32> + Send + Sync>,
+    receive: Box<dyn Fn(UdpFlow, Vec<u8>) + Send + Sync>,
+    timeout: Box<dyn Fn(UdpFlow) + Send + Sync>,
+}
+
+pub struct UdpSocket<'runtime> {
+    runtime: &'runtime Runtime,
+    socket_id: c_int,
+    callbacks: Option<Box<UdpCallbacks>>,
+}
+
+impl UdpSocket<'_> {
+    pub fn establish(
+        &self,
+        remote_host: &str,
+        remote_port: u16,
+        timeout_seconds: NonZeroU32,
+    ) -> Result<UdpFlow, Error> {
+        let timeout_seconds =
+            c_int::try_from(timeout_seconds.get()).map_err(|_| Error::TimeoutOutOfRange)?;
+        let flow = encode_udp_flow(remote_host, remote_port, self.socket_id)?;
+        let callback_data = self
+            .callbacks
+            .as_ref()
+            .expect("UDP callback data remains alive until the socket is closed");
+        let mut request = OutboundFlowRequest {
+            callback_data: (&**callback_data as *const UdpCallbacks).cast_mut().cast(),
+            timeout_seconds,
+        };
+        let code = unsafe {
+            lokinet_udp_establish(
+                udp_create_flow_callback,
+                (&mut request as *mut OutboundFlowRequest).cast(),
+                &flow,
+                self.runtime.raw.as_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(Error::NativeCall {
+                operation: "UDP flow establishment",
+                code,
+            });
+        }
+        decode_udp_flow(&flow).ok_or(Error::InvalidUdpFlow)
+    }
+
+    pub fn send(&self, flow: &UdpFlow, data: &[u8]) -> Result<(), Error> {
+        if data.is_empty() || flow.socket_id != self.socket_id {
+            return Err(Error::InvalidUdpFlow);
+        }
+        let raw_flow = encode_udp_flow(&flow.remote_host, flow.remote_port, flow.socket_id)?;
+        let code = unsafe {
+            lokinet_udp_flow_send(
+                &raw_flow,
+                data.as_ptr().cast(),
+                data.len(),
+                self.runtime.raw.as_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(Error::NativeCall {
+                operation: "UDP send",
+                code,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UdpSocket<'_> {
+    fn drop(&mut self) {
+        unsafe { lokinet_udp_close(self.socket_id, self.runtime.raw.as_ptr()) };
+        if let Some(callbacks) = self.callbacks.take() {
+            self.runtime
+                .retired_udp_callbacks
+                .borrow_mut()
+                .push(callbacks);
+        }
+    }
+}
+
+struct OutboundFlowRequest {
+    callback_data: *mut c_void,
+    timeout_seconds: c_int,
+}
+
+unsafe extern "C" fn udp_create_flow_callback(
+    userdata: *mut c_void,
+    flow_userdata: *mut *mut c_void,
+    timeout_seconds: *mut c_int,
+) {
+    if userdata.is_null() || flow_userdata.is_null() || timeout_seconds.is_null() {
+        return;
+    }
+    let request = unsafe { &*userdata.cast::<OutboundFlowRequest>() };
+    unsafe {
+        *flow_userdata = request.callback_data;
+        *timeout_seconds = request.timeout_seconds;
+    }
+}
+
+unsafe extern "C" fn udp_filter_callback(
+    userdata: *mut c_void,
+    remote: *const RawUdpFlowInfo,
+    flow_userdata: *mut *mut c_void,
+    timeout_seconds: *mut c_int,
+) -> c_int {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if userdata.is_null() || flow_userdata.is_null() || timeout_seconds.is_null() {
+            return 1;
+        }
+        let Some(flow) = (unsafe { remote.as_ref() }).and_then(decode_udp_flow) else {
+            return 1;
+        };
+        let callbacks = unsafe { &*userdata.cast::<UdpCallbacks>() };
+        match (callbacks.filter)(&flow) {
+            Some(timeout) => {
+                let Ok(seconds) = c_int::try_from(timeout.get()) else {
+                    return 1;
+                };
+                unsafe {
+                    *flow_userdata = userdata;
+                    *timeout_seconds = seconds;
+                }
+                0
+            }
+            None => 1,
+        }
+    }))
+    .unwrap_or(1)
+}
+
+unsafe extern "C" fn udp_receive_callback(
+    remote: *const RawUdpFlowInfo,
+    data: *const c_char,
+    length: usize,
+    flow_userdata: *mut c_void,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if flow_userdata.is_null()
+            || (data.is_null() && length != 0)
+            || length > isize::MAX as usize
+        {
+            return;
+        }
+        let Some(flow) = (unsafe { remote.as_ref() }).and_then(decode_udp_flow) else {
+            return;
+        };
+        let packet = if length == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) }.to_vec()
+        };
+        let callbacks = unsafe { &*flow_userdata.cast::<UdpCallbacks>() };
+        (callbacks.receive)(flow, packet)
+    }));
+}
+
+unsafe extern "C" fn udp_timeout_callback(
+    remote: *const RawUdpFlowInfo,
+    flow_userdata: *mut c_void,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if flow_userdata.is_null() {
+            return;
+        }
+        let Some(flow) = (unsafe { remote.as_ref() }).and_then(decode_udp_flow) else {
+            return;
+        };
+        let callbacks = unsafe { &*flow_userdata.cast::<UdpCallbacks>() };
+        (callbacks.timeout)(flow)
+    }));
+}
+
+fn encode_udp_flow(
+    remote_host: &str,
+    remote_port: u16,
+    socket_id: c_int,
+) -> Result<RawUdpFlowInfo, Error> {
+    if remote_host.is_empty()
+        || remote_host.as_bytes().len() >= 256
+        || remote_host.contains('\0')
+        || remote_port == 0
+    {
+        return Err(Error::InvalidUdpFlow);
+    }
+    let mut host = [0; 256];
+    for (target, source) in host.iter_mut().zip(remote_host.bytes()) {
+        *target = source as c_char;
+    }
+    Ok(RawUdpFlowInfo {
+        remote_host: host,
+        remote_port,
+        socket_id,
+    })
+}
+
+fn decode_udp_flow(raw: &RawUdpFlowInfo) -> Option<UdpFlow> {
+    let host = decode_fixed_string(&raw.remote_host)?;
+    if host.is_empty() || raw.remote_port == 0 {
+        return None;
+    }
+    Some(UdpFlow {
+        remote_host: host,
+        remote_port: raw.remote_port,
+        socket_id: raw.socket_id,
+    })
+}
+
+fn decode_fixed_string(raw: &[c_char]) -> Option<String> {
+    let bytes = raw
+        .iter()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    String::from_utf8(bytes).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamDecision {
+    Accept,
+    Reject,
+    Drop,
+}
+
+type StreamFilter = dyn Fn(&str, u16) -> StreamDecision + Send + Sync;
+
+struct StreamFilterData {
+    filter: Box<StreamFilter>,
+}
+
+pub struct TcpStream<'runtime> {
+    runtime: &'runtime Runtime,
+    stream_id: c_int,
+    local_address: String,
+    local_port: u16,
+}
+
+impl TcpStream<'_> {
+    pub fn local_address(&self) -> &str {
+        &self.local_address
+    }
+
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    pub fn stream_id(&self) -> c_int {
+        self.stream_id
+    }
+}
+
+impl Drop for TcpStream<'_> {
+    fn drop(&mut self) {
+        unsafe { lokinet_close_stream(self.stream_id, self.runtime.raw.as_ptr()) };
+    }
+}
+
+pub struct TcpListener<'runtime> {
+    runtime: &'runtime Runtime,
+    stream_id: c_int,
+    callback: Option<Box<StreamFilterData>>,
+}
+
+impl TcpListener<'_> {
+    pub fn stream_id(&self) -> c_int {
+        self.stream_id
+    }
+}
+
+impl Drop for TcpListener<'_> {
+    fn drop(&mut self) {
+        unsafe { lokinet_close_stream(self.stream_id, self.runtime.raw.as_ptr()) };
+        self.callback.take();
+    }
+}
+
+unsafe extern "C" fn stream_filter_callback(
+    remote: *const c_char,
+    port: u16,
+    userdata: *mut c_void,
+) -> c_int {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if remote.is_null() || userdata.is_null() {
+            return -1;
+        }
+        let Ok(remote) = (unsafe { CStr::from_ptr(remote) }).to_str() else {
+            return -1;
+        };
+        let filter = unsafe { &*userdata.cast::<StreamFilterData>() };
+        match (filter.filter)(remote, port) {
+            StreamDecision::Accept => 0,
+            StreamDecision::Reject => -1,
+            StreamDecision::Drop => -2,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -174,5 +700,22 @@ mod tests {
     fn accepts_explicit_absolute_state_directory() {
         let config = Config::new("", "/state/lokinet").validate().unwrap();
         assert_eq!(config.data_dir(), Path::new("/state/lokinet"));
+    }
+
+    #[test]
+    fn udp_flow_requires_a_valid_host_and_port() {
+        assert!(encode_udp_flow("remote.loki", 1234, 1).is_ok());
+        assert!(encode_udp_flow("", 1234, 1).is_err());
+        assert!(encode_udp_flow("remote.loki", 0, 1).is_err());
+        assert!(encode_udp_flow(&"x".repeat(256), 1234, 1).is_err());
+    }
+
+    #[test]
+    fn udp_flow_round_trips_through_the_c_layout() {
+        let raw = encode_udp_flow("remote.loki", 1234, 7).unwrap();
+        let flow = decode_udp_flow(&raw).unwrap();
+        assert_eq!(flow.remote_host(), "remote.loki");
+        assert_eq!(flow.remote_port(), 1234);
+        assert_eq!(flow.socket_id, 7);
     }
 }
