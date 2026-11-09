@@ -1,10 +1,13 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::io;
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 unsafe extern "C" {
     fn lokinet_context_new() -> *mut RawLokinet;
@@ -16,8 +19,33 @@ unsafe extern "C" {
         context: *mut RawLokinet,
     ) -> c_int;
     fn lokinet_context_start(context: *mut RawLokinet) -> c_int;
+    fn lokinet_context_enable_ip_packet_io(context: *mut RawLokinet) -> c_int;
+    fn lokinet_ip_packet_send(
+        packet: *const u8,
+        packet_size: usize,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_ip_packet_receive(
+        packet: *mut u8,
+        packet_capacity: usize,
+        packet_size: *mut usize,
+        timeout_ms: u32,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_ip_packet_local_address(
+        address: *mut c_char,
+        address_capacity: usize,
+        context: *mut RawLokinet,
+    ) -> c_int;
+    fn lokinet_ip_packet_local_ipv6_address(
+        address: *mut c_char,
+        address_capacity: usize,
+        context: *mut RawLokinet,
+    ) -> c_int;
     fn lokinet_status(context: *mut RawLokinet) -> c_int;
+    fn lokinet_address(context: *mut RawLokinet) -> *mut c_char;
     fn lokinet_context_free(context: *mut RawLokinet);
+    fn free(pointer: *mut c_void);
     fn lokinet_udp_bind(
         exposed_port: u16,
         filter: unsafe extern "C" fn(
@@ -145,6 +173,7 @@ impl ValidatedConfig {
 pub enum Error {
     DataDirectoryMustBeAbsolute(PathBuf),
     InvalidStreamResult,
+    InvalidAddress,
     InvalidString,
     InvalidUdpFlow,
     Native(String),
@@ -168,6 +197,7 @@ impl fmt::Display for Error {
                 )
             }
             Self::InvalidStreamResult => write!(f, "Lokinet returned an invalid TCP stream result"),
+            Self::InvalidAddress => write!(f, "Lokinet returned an invalid address"),
             Self::InvalidString => write!(f, "Lokinet config contains an interior NUL"),
             Self::InvalidUdpFlow => write!(f, "invalid Lokinet UDP flow"),
             Self::Native(message) => write!(f, "Lokinet initialization failed: {message}"),
@@ -210,6 +240,18 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn start(config: Config) -> Result<Self, Error> {
+        Self::start_inner(config, false)
+    }
+
+    pub fn start_with_ip_packet_io(config: Config) -> Result<(Self, IpPacketIo), Error> {
+        let runtime = Self::start_inner(config, true)?;
+        let packet_io = IpPacketIo {
+            inner: Arc::clone(&runtime.inner),
+        };
+        Ok((runtime, packet_io))
+    }
+
+    fn start_inner(config: Config, enable_ip_packet_io: bool) -> Result<Self, Error> {
         let config = config.validate()?;
         let config_text = CString::new(config.config_text).map_err(|_| Error::InvalidString)?;
         let data_dir = config
@@ -239,6 +281,16 @@ impl Runtime {
             return Err(Error::Native(message));
         }
 
+        if enable_ip_packet_io {
+            let result = unsafe { lokinet_context_enable_ip_packet_io(runtime.inner.raw.as_ptr()) };
+            if result != 0 {
+                return Err(Error::NativeCall {
+                    operation: "IP packet I/O enable",
+                    code: result,
+                });
+            }
+        }
+
         if unsafe { lokinet_context_start(runtime.inner.raw.as_ptr()) } != 0 {
             return Err(Error::Native(
                 "failed to start the Lokinet context".to_owned(),
@@ -247,8 +299,58 @@ impl Runtime {
         Ok(runtime)
     }
 
+    pub fn ip_packet_local_address(&self) -> Result<IpAddr, Error> {
+        self.ip_packet_local_address_inner(false)
+    }
+
+    pub fn ip_packet_local_ipv6_address(&self) -> Result<IpAddr, Error> {
+        self.ip_packet_local_address_inner(true)
+    }
+
+    fn ip_packet_local_address_inner(&self, ipv6: bool) -> Result<IpAddr, Error> {
+        let mut address = [0 as c_char; 64];
+        let result = unsafe {
+            if ipv6 {
+                lokinet_ip_packet_local_ipv6_address(
+                    address.as_mut_ptr(),
+                    address.len(),
+                    self.inner.raw.as_ptr(),
+                )
+            } else {
+                lokinet_ip_packet_local_address(
+                    address.as_mut_ptr(),
+                    address.len(),
+                    self.inner.raw.as_ptr(),
+                )
+            }
+        };
+        if result != 0 {
+            return Err(Error::NativeCall {
+                operation: "IP packet local address",
+                code: result,
+            });
+        }
+        let address = unsafe { CStr::from_ptr(address.as_ptr()) }
+            .to_str()
+            .map_err(|_| Error::InvalidAddress)?;
+        address.parse().map_err(|_| Error::InvalidAddress)
+    }
+
     pub fn is_connected(&self) -> bool {
         unsafe { lokinet_status(self.inner.raw.as_ptr()) == 0 }
+    }
+
+    pub fn address(&self) -> Result<Option<String>, Error> {
+        let Some(address) = NonNull::new(unsafe { lokinet_address(self.inner.raw.as_ptr()) })
+        else {
+            return Ok(None);
+        };
+        let decoded = unsafe { CStr::from_ptr(address.as_ptr()) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_| Error::InvalidAddress);
+        unsafe { free(address.as_ptr().cast()) };
+        decoded.map(Some)
     }
 
     pub fn bind_udp<F, R, T>(
@@ -374,6 +476,52 @@ impl Runtime {
     }
 }
 
+#[derive(Clone)]
+pub struct IpPacketIo {
+    inner: Arc<ContextInner>,
+}
+
+impl IpPacketIo {
+    pub fn receive(&self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        let timeout_ms = u32::try_from(timeout.as_millis()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet receive timeout exceeds the native API limit",
+            )
+        })?;
+        let mut packet_size = 0;
+        let result = unsafe {
+            lokinet_ip_packet_receive(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut packet_size,
+                timeout_ms,
+                self.inner.raw.as_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        if packet_size > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Lokinet returned an oversized IP packet",
+            ));
+        }
+        Ok(packet_size)
+    }
+
+    pub fn send_packet(&self, packet: &[u8]) -> io::Result<()> {
+        let result = unsafe {
+            lokinet_ip_packet_send(packet.as_ptr(), packet.len(), self.inner.raw.as_ptr())
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpFlow {
     remote_host: String,
@@ -460,7 +608,7 @@ impl UdpSocket {
     }
 
     pub fn send(&self, flow: &UdpFlow, data: &[u8]) -> Result<(), Error> {
-        if data.is_empty() || flow.socket_id != self.inner.socket_id {
+        if flow.socket_id != self.inner.socket_id {
             return Err(Error::InvalidUdpFlow);
         }
         let raw_flow = encode_udp_flow(&flow.remote_host, flow.remote_port, flow.socket_id)?;

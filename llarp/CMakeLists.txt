@@ -161,6 +161,7 @@ add_library(lokinet-amalgum
   exit/session.cpp
   handlers/exit.cpp
   handlers/tun.cpp
+  vpn/socks6_packet_platform.cpp
   iwp/iwp.cpp
   iwp/linklayer.cpp
   iwp/message_buffer.cpp
@@ -302,17 +303,26 @@ endif()
 
 if(BUILD_LIBLOKINET)
   include(GNUInstallDirs)
-  add_library(lokinet-shared SHARED lokinet_shared.cpp)
-  target_link_libraries(lokinet-shared PUBLIC lokinet-amalgum)
+  if(STATIC_LINK)
+    add_library(lokinet-static STATIC lokinet_shared.cpp)
+    set(lokinet_lib_target lokinet-static)
+  else()
+    add_library(lokinet-shared SHARED lokinet_shared.cpp)
+    set(lokinet_lib_target lokinet-shared)
+  endif()
+  target_link_libraries(${lokinet_lib_target} PUBLIC lokinet-amalgum)
   if(WIN32)
     set(CMAKE_SHARED_LIBRARY_PREFIX_CXX "")
   endif()
-  set_target_properties(lokinet-shared PROPERTIES OUTPUT_NAME lokinet)
+  set_target_properties(${lokinet_lib_target} PROPERTIES OUTPUT_NAME lokinet)
   if(WIN32)
-    target_link_libraries(lokinet-shared PUBLIC ws2_32 iphlpapi -fstack-protector)
-    install(TARGETS lokinet-shared DESTINATION bin COMPONENT liblokinet)
+    target_link_libraries(${lokinet_lib_target} PUBLIC ws2_32 iphlpapi -fstack-protector)
+    install(TARGETS ${lokinet_lib_target} DESTINATION bin COMPONENT liblokinet)
   elseif(NOT APPLE)
-    install(TARGETS lokinet-shared LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT liblokinet)
+    install(TARGETS ${lokinet_lib_target}
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      COMPONENT liblokinet)
   endif()
   configure_file(
     "${PROJECT_SOURCE_DIR}/cmake/lokinet-embedded.pc.in"

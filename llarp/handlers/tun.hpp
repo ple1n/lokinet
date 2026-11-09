@@ -152,6 +152,12 @@ namespace llarp
       huint128_t
       GetIfAddr() const override;
 
+      huint128_t
+      GetIfIPv6Addr() const
+      {
+        return m_OurIPv6;
+      }
+
       /// we have an interface addr
       bool
       HasIfAddr() const override

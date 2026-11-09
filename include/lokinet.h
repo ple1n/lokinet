@@ -6,3 +6,4 @@
 #include "lokinet/lokinet_addr.h"
 #include "lokinet/lokinet_stream.h"
 #include "lokinet/lokinet_udp.h"
+#include "lokinet/lokinet_packet.h"

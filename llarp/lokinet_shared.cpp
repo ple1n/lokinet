@@ -8,6 +8,8 @@
 #include <llarp/service/name.hpp>
 #include <llarp/quic/tunnel.hpp>
 #include <llarp/nodedb.hpp>
+#include <llarp/handlers/tun.hpp>
+#include <llarp/vpn/socks6_packet_platform.hpp>
 
 #include <llarp/util/logging.hpp>
 #include <llarp/util/logging/buffer.hpp>
@@ -23,6 +25,7 @@
 #include <memory>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 
@@ -43,13 +46,26 @@ namespace
 
   struct Context : public llarp::Context
   {
-    using llarp::Context::Context;
+    explicit Context(std::shared_ptr<llarp::vpn::Socks6PacketPlatform> packet_platform)
+        : m_PacketPlatform{std::move(packet_platform)}
+    {}
 
     std::shared_ptr<llarp::NodeDB>
     makeNodeDB() override
     {
       return std::make_shared<llarp::NodeDB>();
     }
+
+    std::shared_ptr<llarp::vpn::Platform>
+    makeVPNPlatform() override
+    {
+      if (m_PacketPlatform->IsEnabled())
+        return m_PacketPlatform;
+      return llarp::Context::makeVPNPlatform();
+    }
+
+   private:
+    std::shared_ptr<llarp::vpn::Socks6PacketPlatform> m_PacketPlatform;
   };
 
   struct UDPFlow
@@ -221,8 +237,11 @@ struct lokinet_context
 {
   std::mutex m_access;
 
-  std::shared_ptr<llarp::Context> impl = std::make_shared<Context>();
+  std::shared_ptr<llarp::vpn::Socks6PacketPlatform> packet_platform =
+      std::make_shared<llarp::vpn::Socks6PacketPlatform>();
+  std::shared_ptr<llarp::Context> impl = std::make_shared<Context>(packet_platform);
   std::shared_ptr<llarp::Config> config = llarp::Config::EmbeddedConfig();
+  bool config_set = false;
 
   std::unique_ptr<std::thread> runner;
 
@@ -582,6 +601,8 @@ extern "C"
     auto lock = ctx->acquire();
     if (ctx->runner)
       return fail(EBUSY, "Lokinet context has already been started");
+    if (ctx->packet_platform->IsEnabled())
+      return fail(EBUSY, "packet I/O has already been enabled");
 
     try
     {
@@ -599,6 +620,7 @@ extern "C"
       config->network.m_saveProfiles = false;
       config->bootstrap.files.clear();
       ctx->config = std::move(config);
+      ctx->config_set = true;
       if (error_buffer && error_buffer_size)
         error_buffer[0] = '\0';
       return 0;
@@ -607,6 +629,77 @@ extern "C"
     {
       return fail(EINVAL, e.what());
     }
+  }
+
+  int EXPORT
+  lokinet_context_enable_ip_packet_io(struct lokinet_context* ctx)
+  {
+    if (not ctx)
+      return EINVAL;
+    auto lock = ctx->acquire();
+    if (ctx->runner)
+      return EBUSY;
+    if (not ctx->config_set)
+      return EINVAL;
+    const int result = ctx->packet_platform->Enable();
+    if (result != 0)
+      return result;
+    ctx->config->network.m_endpointType = "tun";
+    ctx->config->dns.m_bind.clear();
+    ctx->config->network.m_EnableRoutePoker = false;
+    return 0;
+  }
+
+  int EXPORT
+  lokinet_ip_packet_send(
+      const uint8_t* packet, size_t packet_size, struct lokinet_context* ctx)
+  {
+    if (not ctx)
+      return EINVAL;
+    return ctx->packet_platform->SendPacket(packet, packet_size);
+  }
+
+  int EXPORT
+  lokinet_ip_packet_receive(
+      uint8_t* packet,
+      size_t packet_capacity,
+      size_t* packet_size,
+      uint32_t timeout_ms,
+      struct lokinet_context* ctx)
+  {
+    if (not ctx)
+      return EINVAL;
+    return ctx->packet_platform->ReceivePacket(packet, packet_capacity, packet_size, timeout_ms);
+  }
+
+  int EXPORT
+  lokinet_ip_packet_local_address(
+      char* address, size_t address_capacity, struct lokinet_context* ctx)
+  {
+    if (not ctx)
+      return EINVAL;
+    return ctx->packet_platform->GetLocalAddress(address, address_capacity);
+  }
+
+  int EXPORT
+  lokinet_ip_packet_local_ipv6_address(
+      char* address, size_t address_capacity, struct lokinet_context* ctx)
+  {
+    if (not ctx or not address or address_capacity == 0)
+      return EINVAL;
+    auto lock = ctx->acquire();
+    auto router = ctx->impl->router;
+    if (not router)
+      return EAGAIN;
+    auto endpoint = std::dynamic_pointer_cast<llarp::handlers::TunEndpoint>(
+        router->hiddenServiceContext().GetDefault());
+    if (not endpoint)
+      return EAGAIN;
+    const auto value = endpoint->GetIfIPv6Addr().ToString();
+    if (value.size() >= address_capacity)
+      return ENOSPC;
+    std::memcpy(address, value.c_str(), value.size() + 1);
+    return 0;
   }
 
   void EXPORT
@@ -1015,8 +1108,7 @@ extern "C"
       size_t len,
       struct lokinet_context* ctx)
   {
-    if (remote == nullptr or remote->remote_port == 0 or ptr == nullptr or len == 0
-        or ctx == nullptr)
+    if (remote == nullptr or remote->remote_port == 0 or ptr == nullptr or ctx == nullptr)
       return EINVAL;
     std::shared_ptr<llarp::EndpointBase> ep;
     llarp::nuint16_t srcport{0};
