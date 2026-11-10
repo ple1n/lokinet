@@ -506,7 +506,10 @@ namespace llarp::quic
     // accept handler, and to let the accept handler know that `this` is still safe to use.
     ct.tcp->data(std::make_shared<uint16_t>(pport));
 
-    auto after_path = [this, port, pport = pport, remote_addr](auto maybe_convo) {
+    std::weak_ptr<int> manager_lifetime = timer_keepalive_;
+    auto after_path = [this, manager_lifetime, port, pport = pport, remote_addr](auto maybe_convo) {
+      if (manager_lifetime.expired())
+        return;
       if (not continue_connecting(pport, (bool)maybe_convo, "path build", remote_addr))
         return;
       SockAddr dest{maybe_convo->ToV6()};
@@ -518,18 +521,70 @@ namespace llarp::quic
     {
       // We were given an ONS address, so it's a two-step process: first we resolve the ONS name,
       // then we have to build a path to that address.
-      service_endpoint_.LookupNameAsync(
-          remote_addr,
-          [this,
-           after_path = std::move(after_path),
-           pport = pport,
-           remote_addr = std::move(remote_addr)](auto maybe_remote) {
-            if (not continue_connecting(
-                    pport, (bool)maybe_remote, "endpoint ONS lookup", remote_addr))
-              return;
-            service_endpoint_.MarkAddressOutbound(*maybe_remote);
-            service_endpoint_.EnsurePathTo(*maybe_remote, after_path, open_timeout);
-          });
+      auto loop = service_endpoint_.Loop();
+      const auto lookup_deadline = loop->time_now() + open_timeout.count();
+      auto retry_lookup = std::make_shared<std::function<void()>>();
+      std::weak_ptr<std::function<void()>> weak_retry_lookup = retry_lookup;
+      std::weak_ptr<int> weak_manager_lifetime = timer_keepalive_;
+      *retry_lookup = [this,
+                       weak_manager_lifetime,
+                       pport,
+                       remote_addr,
+                       after_path = std::move(after_path),
+                       lookup_deadline,
+                       weak_retry_lookup]() {
+        auto keep_alive = weak_retry_lookup.lock();
+        if (not keep_alive or weak_manager_lifetime.expired()
+            or client_tunnels_.find(pport) == client_tunnels_.end())
+          return;
+
+        if (not service_endpoint_.ReadyForNameLookup())
+        {
+          if (service_endpoint_.Loop()->time_now() >= lookup_deadline)
+          {
+            continue_connecting(pport, false, "network readiness", remote_addr);
+            return;
+          }
+          service_endpoint_.Loop()->call_later(100, [keep_alive] { (*keep_alive)(); });
+          return;
+        }
+
+        service_endpoint_.LookupNameAsync(
+            remote_addr,
+            [this,
+             weak_manager_lifetime,
+             pport,
+             remote_addr,
+             after_path,
+             lookup_deadline,
+             keep_alive](auto maybe_remote) {
+              if (weak_manager_lifetime.expired())
+                return;
+              if (maybe_remote)
+              {
+                if (not continue_connecting(pport, true, "endpoint ONS lookup", remote_addr))
+                  return;
+                service_endpoint_.MarkAddressOutbound(*maybe_remote);
+                service_endpoint_.EnsurePathTo(*maybe_remote, after_path, open_timeout);
+                return;
+              }
+
+              if (not service_endpoint_.ReadyForNameLookup())
+              {
+                if (service_endpoint_.Loop()->time_now() < lookup_deadline)
+                {
+                  service_endpoint_.Loop()->call_later(
+                      100, [keep_alive] { (*keep_alive)(); });
+                  return;
+                }
+                continue_connecting(pport, false, "network readiness", remote_addr);
+                return;
+              }
+
+              continue_connecting(pport, false, "endpoint ONS lookup", remote_addr);
+            });
+      };
+      (*retry_lookup)();
       return result;
     }
 

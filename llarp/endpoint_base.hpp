@@ -129,6 +129,12 @@ namespace llarp
     LookupNameAsync(
         std::string name, std::function<void(std::optional<AddressVariant_t>)> resultHandler) = 0;
 
+    virtual bool
+    ReadyForNameLookup() const
+    {
+      return true;
+    }
+
     virtual const EventLoop_ptr&
     Loop() = 0;
 

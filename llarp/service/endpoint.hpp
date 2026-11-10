@@ -73,6 +73,12 @@ namespace llarp
       bool
       IsReady() const;
 
+      bool
+      ReadyForNameLookup() const override
+      {
+        return ReadyToDoLookup(GetUniqueEndpointsForLookup().size());
+      }
+
       void
       QueueRecvData(RecvDataEvent ev) override;
 
