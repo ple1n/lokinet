@@ -116,7 +116,8 @@ namespace llarp
             "could not publish descriptors for endpoint ",
             Name(),
             " because we couldn't get enough valid introductions");
-        BuildOne();
+        if (not BuildCooldownHit(now))
+          BuildOne();
         return;
       }
 
@@ -778,7 +779,9 @@ namespace llarp
       if (not m_PublishIntroSet)
         return false;
 
-      const auto lastEventAt = std::max(m_state->m_LastPublishAttempt, m_state->m_LastPublish);
+      const auto lastEventAt = std::max(
+          std::max(m_state->m_LastPublishAttempt, m_state->m_LastPublish),
+          m_LastIntrosetRegenAttempt);
       const auto next_pub = lastEventAt
           + (m_state->m_IntroSet.HasStaleIntros(now, path::intro_stale_threshold)
                  ? IntrosetPublishRetryCooldown

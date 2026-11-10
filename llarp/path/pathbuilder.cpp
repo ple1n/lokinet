@@ -332,7 +332,12 @@ namespace llarp
     Builder::BuildOne(PathRole roles)
     {
       if (const auto maybe = GetHopsForBuild())
+      {
         Build(*maybe, roles);
+        return;
+      }
+      lastBuild = Now();
+      DoPathBuildBackoff();
     }
 
     bool
