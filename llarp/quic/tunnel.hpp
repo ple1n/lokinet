@@ -40,6 +40,13 @@ namespace llarp::quic
   class TunnelManager
   {
    public:
+    struct OpenResult
+    {
+      bool success;
+      bool retryable;
+      std::string phase;
+    };
+
     using ListenHandler = std::function<std::optional<SockAddr>(
         std::string_view lokinet_addr,  // The remote's full lokinet address
         uint16_t port                   // The requested port the tunnel wants to reach
@@ -77,8 +84,8 @@ namespace llarp::quic
     void
     forget(int id);
 
-    /// Called when open succeeds or times out.
-    using OpenCallback = std::function<void(bool success)>;
+    /// Called when the first target TCP connection succeeds or tunnel setup fails.
+    using OpenCallback = std::function<void(OpenResult result)>;
 
     /// Opens a quic tunnel to some remote lokinet address.  (Should only be called from the event
     /// loop thread.)
@@ -87,28 +94,26 @@ namespace llarp::quic
     /// `blocks.loki`) that the tunnel should connect to.
     /// \param port is the tunneled port on the remote that the client wants to reach.  (This is
     /// *not* the quic pseudo-port, which is always 0).
-    /// \param callback callback invoked when the quic connection has been established, or has timed
-    /// out.
+    /// \param callback callback invoked when the first target TCP connection succeeds or setup
+    /// fails.
     /// \param bind_addr is the bind address and port that we should use for the localhost TCP
     /// connection.  Use port 0 to let the OS choose a random high port.  Defaults to `127.0.0.1:0`.
     ///
     /// This call immediately opens the local TCP socket, and initiates the lokinet connection and
-    /// QUIC tunnel to the remote.  If the connection fails, the TCP socket will be closed.  Note,
-    /// however, that this TCP socket will block until the underlying quic connection is
-    /// established.
+    /// QUIC tunnel to the remote. If setup fails, the TCP socket will be closed. The callback
+    /// reports success only after the remote TCP handshake has completed.
     ///
     /// Each connection to the local TCP socket establishes a new stream over the QUIC connection.
     ///
     /// \return a pair:
     /// - SockAddr containing the just-opened localhost socket that tunnels to the remote.  This is
     /// typically the same IP as `bind_addr`, with the port filled in (if bind_addr had a 0 port).
-    /// Note that, while you can connect to this socket immediately, it will block until the actual
-    /// connection and streams are established (and will be closed if they fail).
+    /// The local TCP handshake may complete before the remote target is ready; the callback is
+    /// the authoritative signal for remote connection success or failure.
     /// - unique integer that can be passed to close() to stop listening for new connections.  This
     /// also serves as a unique internal "pseudo-port" number to route returned quic packets to the
     /// right connection.
     ///
-    /// TODO: add a callback to invoke when QUIC connection succeeds or fails.
     /// TODO: add a plain C wrapper around this
     std::pair<SockAddr, uint16_t>
     open(

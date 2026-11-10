@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
+#include <condition_variable>
 #include <future>
 #include <mutex>
 #include <memory>
@@ -28,6 +30,7 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <unordered_map>
 
 #ifdef _WIN32
 #define EHOSTDOWN ENETDOWN
@@ -233,6 +236,25 @@ namespace
   };
 }  // namespace
 
+struct lokinet_stream_open_status
+{
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::optional<llarp::quic::TunnelManager::OpenResult> result;
+
+  void
+  complete(llarp::quic::TunnelManager::OpenResult value)
+  {
+    {
+      std::unique_lock lock{mutex};
+      if (result)
+        return;
+      result = std::move(value);
+    }
+    changed.notify_all();
+  }
+};
+
 struct lokinet_context
 {
   std::mutex m_access;
@@ -365,6 +387,7 @@ struct lokinet_context
   }
 
   std::unordered_map<int, bool> streams;
+  std::unordered_map<int, std::shared_ptr<lokinet_stream_open_status>> stream_open_status;
   std::unordered_map<int, std::shared_ptr<UDPHandler>> udp_sockets;
 
   void
@@ -374,9 +397,10 @@ struct lokinet_context
   }
 
   void
-  outbound_stream(int id)
+  outbound_stream(int id, std::shared_ptr<lokinet_stream_open_status> status)
   {
     streams[id] = false;
+    stream_open_status[id] = std::move(status);
   }
 };
 
@@ -853,6 +877,7 @@ extern "C"
       auto call = [&promise,
                    ctx,
                    result,
+                   open_status = std::make_shared<lokinet_stream_open_status>(),
                    router = ctx->impl->router,
                    remotehost,
                    remoteport,
@@ -875,9 +900,12 @@ extern "C"
         try
         {
           auto [addr, id] = quic->open(
-              remotehost, remoteport, [](auto) {}, localAddr);
+              remotehost,
+              remoteport,
+              [open_status](auto open_result) { open_status->complete(std::move(open_result)); },
+              localAddr);
           auto [host, port] = split_host_port(addr.ToString());
-          ctx->outbound_stream(id);
+          ctx->outbound_stream(id, std::move(open_status));
           stream_okay(result, host, port, id);
         }
         catch (std::exception& ex)
@@ -920,6 +948,44 @@ extern "C"
     {
       stream_error(result, EBADF);
     }
+  }
+
+  int EXPORT
+  lokinet_stream_wait_ready(
+      int stream_id,
+      uint32_t timeout_ms,
+      int* retryable,
+      char* phase,
+      size_t phase_capacity,
+      struct lokinet_context* ctx)
+  {
+    if (ctx == nullptr || retryable == nullptr || (phase == nullptr && phase_capacity != 0))
+      return EINVAL;
+    std::shared_ptr<lokinet_stream_open_status> status;
+    {
+      auto lock = ctx->acquire();
+      auto it = ctx->stream_open_status.find(stream_id);
+      if (it == ctx->stream_open_status.end())
+        return ENOENT;
+      status = it->second;
+    }
+
+    std::unique_lock lock{status->mutex};
+    if (!status->changed.wait_for(
+            lock,
+            std::chrono::milliseconds{timeout_ms},
+            [&status] { return status->result.has_value(); }))
+      return ETIMEDOUT;
+
+    const auto& result = *status->result;
+    *retryable = result.retryable ? 1 : 0;
+    if (phase_capacity > 0)
+    {
+      const auto size = std::min(result.phase.size(), phase_capacity - 1);
+      std::memcpy(phase, result.phase.data(), size);
+      phase[size] = '\0';
+    }
+    return result.success ? 0 : EHOSTUNREACH;
   }
 
   int EXPORT
@@ -999,13 +1065,22 @@ extern "C"
     if (not ctx)
       return;
     auto lock = ctx->acquire();
+    auto stream = ctx->streams.find(stream_id);
+    if (stream == ctx->streams.end())
+      return;
+    const bool inbound = stream->second;
+    ctx->streams.erase(stream);
+    if (auto it = ctx->stream_open_status.find(stream_id); it != ctx->stream_open_status.end())
+    {
+      it->second->complete({false, true, "cancelled"});
+      ctx->stream_open_status.erase(it);
+    }
     if (not ctx->impl->IsUp())
       return;
 
     try
     {
       std::promise<void> promise;
-      bool inbound = ctx->streams.at(stream_id);
       ctx->impl->CallSafe([stream_id, inbound, ctx, &promise]() {
         auto ep = ctx->endpoint();
         auto* quic = ep->GetQUICTunnel();

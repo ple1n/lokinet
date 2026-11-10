@@ -16,6 +16,8 @@ namespace llarp::quic
 {
   namespace
   {
+    using OpenCompletion = std::function<void(TunnelManager::OpenResult)>;
+
     // Takes data from the tcp connection and pushes it down the quic tunnel
     void
     on_outgoing_data(uvw::DataEvent& event, uvw::TCPHandle& client)
@@ -145,7 +147,11 @@ namespace llarp::quic
     // If the initial byte checks out we replace this handler with the regular stream handler (and
     // forward the rest of the data to it if we got more than just the single byte).
     void
-    initial_client_data_handler(uvw::TCPHandle& client, Stream& stream, bstring_view bdata)
+    initial_client_data_handler(
+        uvw::TCPHandle& client,
+        Stream& stream,
+        bstring_view bdata,
+        OpenCompletion on_open)
     {
       LogTrace("initial client handler; data: ", buffer_printer{bdata});
       if (bdata.empty())
@@ -155,6 +161,8 @@ namespace llarp::quic
 
       if (auto b0 = bdata[0]; b0 == tunnel::CONNECT_INIT)
       {
+        if (on_open)
+          on_open({true, false, "target_connect"});
         // Set up callbacks, which replaces both of these initial callbacks
         client.read();  // Unfreeze (we stop() before putting into pending)
         install_stream_forwarding(client, stream);
@@ -168,6 +176,8 @@ namespace llarp::quic
       }
       else
       {
+        if (on_open)
+          on_open({false, false, "invalid_initial_response"});
         LogWarn(
             "Remote connection returned invalid initial byte (0x",
             oxenc::to_hex(bdata.begin(), bdata.begin() + 1),
@@ -184,8 +194,14 @@ namespace llarp::quic
     // failed):
     void
     initial_client_close_handler(
-        uvw::TCPHandle& client, Stream& /*stream*/, std::optional<uint64_t> error_code)
+        uvw::TCPHandle& client,
+        Stream& /*stream*/,
+        std::optional<uint64_t> error_code,
+        OpenCompletion on_open)
     {
+      if (on_open)
+        on_open(
+            {false, !error_code || *error_code != tunnel::ERROR_CONNECT, "target_connect"});
       if (error_code && *error_code == tunnel::ERROR_CONNECT)
         LogDebug("Remote TCP connection failed, closing local connection");
       else
@@ -421,7 +437,11 @@ namespace llarp::quic
       LogWarn("QUIC tunnel to ", addr, " failed during ", step_name, "; aborting tunnel");
       it->second.tcp->close();
       if (it->second.open_cb)
-        it->second.open_cb(false);
+      {
+        auto on_open = std::exchange(it->second.open_cb, {});
+        const bool retryable = step_name == "network readiness" or step_name == "path build";
+        on_open({false, retryable, std::string{step_name}});
+      }
       client_tunnels_.erase(it);
     }
     return step_success;
@@ -522,7 +542,7 @@ namespace llarp::quic
       // We were given an ONS address, so it's a two-step process: first we resolve the ONS name,
       // then we have to build a path to that address.
       auto loop = service_endpoint_.Loop();
-      const auto lookup_deadline = loop->time_now() + open_timeout.count();
+      const auto lookup_deadline = loop->time_now() + open_timeout;
       auto retry_lookup = std::make_shared<std::function<void()>>();
       std::weak_ptr<std::function<void()>> weak_retry_lookup = retry_lookup;
       std::weak_ptr<int> weak_manager_lifetime = timer_keepalive_;
@@ -545,7 +565,8 @@ namespace llarp::quic
             continue_connecting(pport, false, "network readiness", remote_addr);
             return;
           }
-          service_endpoint_.Loop()->call_later(100, [keep_alive] { (*keep_alive)(); });
+          service_endpoint_.Loop()->call_later(
+              std::chrono::milliseconds{100}, [keep_alive] { (*keep_alive)(); });
           return;
         }
 
@@ -574,7 +595,7 @@ namespace llarp::quic
                 if (service_endpoint_.Loop()->time_now() < lookup_deadline)
                 {
                   service_endpoint_.Loop()->call_later(
-                      100, [keep_alive] { (*keep_alive)(); });
+                      std::chrono::milliseconds{100}, [keep_alive] { (*keep_alive)(); });
                   return;
                 }
                 continue_connecting(pport, false, "network readiness", remote_addr);
@@ -607,6 +628,11 @@ namespace llarp::quic
   {
     if (auto it = client_tunnels_.find(id); it != client_tunnels_.end())
     {
+      if (it->second.open_cb)
+      {
+        auto on_open = std::exchange(it->second.open_cb, {});
+        on_open({false, true, "cancelled"});
+      }
       it->second.tcp->close();
       it->second.tcp->data(nullptr);
       it->second.tcp.reset();
@@ -615,6 +641,8 @@ namespace llarp::quic
 
   TunnelManager::ClientTunnel::~ClientTunnel()
   {
+    if (open_cb)
+      open_cb({false, true, "cancelled"});
     if (tcp)
     {
       tcp->close();
@@ -668,20 +696,33 @@ namespace llarp::quic
       if (not tcp_client)
         continue;
 
+      OpenCompletion on_open;
       try
       {
+        auto callback = std::make_shared<OpenCallback>(std::exchange(ct.open_cb, {}));
+        on_open = [callback](OpenResult result) {
+          if (*callback)
+          {
+            auto completion = std::exchange(*callback, {});
+            completion(std::move(result));
+          }
+        };
         auto str = conn.open_stream(
-            [tcp_client](auto&&... args) {
-              initial_client_data_handler(*tcp_client, std::forward<decltype(args)>(args)...);
+            [tcp_client, on_open](auto&&... args) {
+              initial_client_data_handler(
+                  *tcp_client, std::forward<decltype(args)>(args)..., on_open);
             },
-            [tcp_client](auto&&... args) {
-              initial_client_close_handler(*tcp_client, std::forward<decltype(args)>(args)...);
+            [tcp_client, on_open](auto&&... args) {
+              initial_client_close_handler(
+                  *tcp_client, std::forward<decltype(args)>(args)..., on_open);
             });
         available--;
       }
       catch (const std::exception& e)
       {
         LogWarn("Opening quic stream failed: ", e.what());
+        if (on_open)
+          on_open({false, true, "quic_stream_open"});
         tcp_client->close();
       }
 

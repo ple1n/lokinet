@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,6 +89,15 @@ unsafe extern "C" {
         local: *const c_char,
         context: *mut RawLokinet,
     );
+    fn lokinet_stream_wait_ready(
+        stream_id: c_int,
+        timeout_ms: u32,
+        success: *mut c_int,
+        retryable: *mut c_int,
+        phase: *mut c_char,
+        phase_capacity: usize,
+        context: *mut RawLokinet,
+    ) -> c_int;
     fn lokinet_inbound_stream_filter(
         filter: unsafe extern "C" fn(
             remote: *const c_char,
@@ -176,6 +186,11 @@ pub enum Error {
     InvalidAddress,
     InvalidString,
     InvalidUdpFlow,
+    StreamOpenFailed {
+        phase: String,
+        retryable: bool,
+    },
+    StreamReadyTimeout,
     Native(String),
     NativeCall {
         operation: &'static str,
@@ -200,6 +215,11 @@ impl fmt::Display for Error {
             Self::InvalidAddress => write!(f, "Lokinet returned an invalid address"),
             Self::InvalidString => write!(f, "Lokinet config contains an interior NUL"),
             Self::InvalidUdpFlow => write!(f, "invalid Lokinet UDP flow"),
+            Self::StreamOpenFailed { phase, retryable } => write!(
+                f,
+                "Lokinet stream connection failed during {phase} (retryable: {retryable})"
+            ),
+            Self::StreamReadyTimeout => write!(f, "timed out waiting for Lokinet stream readiness"),
             Self::Native(message) => write!(f, "Lokinet initialization failed: {message}"),
             Self::NativeCall { operation, code } => {
                 write!(f, "Lokinet {operation} failed with error {code}")
@@ -212,7 +232,7 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
-            Self::TimeoutOutOfRange => write!(f, "Lokinet UDP flow timeout is out of range"),
+            Self::TimeoutOutOfRange => write!(f, "timeout is out of range"),
         }
     }
 }
@@ -445,6 +465,7 @@ impl Runtime {
                 stream_id: result.stream_id,
                 local_address,
                 local_port,
+                closed: AtomicBool::new(false),
             }),
         })
     }
@@ -785,11 +806,20 @@ struct TcpStreamInner {
     stream_id: c_int,
     local_address: String,
     local_port: u16,
+    closed: AtomicBool,
+}
+
+impl TcpStreamInner {
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            unsafe { lokinet_close_stream(self.stream_id, self.context.raw.as_ptr()) };
+        }
+    }
 }
 
 impl Drop for TcpStreamInner {
     fn drop(&mut self) {
-        unsafe { lokinet_close_stream(self.stream_id, self.context.raw.as_ptr()) };
+        self.close();
     }
 }
 
@@ -809,6 +839,49 @@ impl TcpStream {
 
     pub fn stream_id(&self) -> c_int {
         self.inner.stream_id
+    }
+
+    /// Blocks until the first tunneled connection reaches the remote TCP target
+    /// or setup fails.
+    pub fn wait_ready(&self, timeout: Duration) -> Result<(), Error> {
+        let timeout_ms =
+            u32::try_from(timeout.as_millis()).map_err(|_| Error::TimeoutOutOfRange)?;
+        let mut success = 0;
+        let mut retryable = 0;
+        let mut phase = [0 as c_char; 128];
+        let result = unsafe {
+            lokinet_stream_wait_ready(
+                self.inner.stream_id,
+                timeout_ms,
+                &mut success,
+                &mut retryable,
+                phase.as_mut_ptr(),
+                phase.len(),
+                self.inner.context.raw.as_ptr(),
+            )
+        };
+        if result != 0 {
+            if std::io::Error::from_raw_os_error(result).kind() == std::io::ErrorKind::TimedOut {
+                return Err(Error::StreamReadyTimeout);
+            }
+            return Err(Error::NativeCall {
+                operation: "waiting for outbound TCP stream readiness",
+                code: result,
+            });
+        }
+        if success != 0 {
+            return Ok(());
+        }
+        let phase = decode_fixed_string(&phase).unwrap_or_else(|| "unknown".to_owned());
+        Err(Error::StreamOpenFailed {
+            phase,
+            retryable: retryable != 0,
+        })
+    }
+
+    /// Stops this tunnel and wakes any thread waiting for readiness.
+    pub fn close(&self) {
+        self.inner.close();
     }
 }
 
