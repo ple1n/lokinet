@@ -954,13 +954,17 @@ extern "C"
   lokinet_stream_wait_ready(
       int stream_id,
       uint32_t timeout_ms,
+      int* success,
       int* retryable,
       char* phase,
       size_t phase_capacity,
       struct lokinet_context* ctx)
   {
-    if (ctx == nullptr || retryable == nullptr || (phase == nullptr && phase_capacity != 0))
+    if (ctx == nullptr || success == nullptr || retryable == nullptr
+        || (phase == nullptr && phase_capacity != 0))
       return EINVAL;
+    *success = 0;
+    *retryable = 0;
     std::shared_ptr<lokinet_stream_open_status> status;
     {
       auto lock = ctx->acquire();
@@ -978,6 +982,7 @@ extern "C"
       return ETIMEDOUT;
 
     const auto& result = *status->result;
+    *success = result.success ? 1 : 0;
     *retryable = result.retryable ? 1 : 0;
     if (phase_capacity > 0)
     {
@@ -985,7 +990,7 @@ extern "C"
       std::memcpy(phase, result.phase.data(), size);
       phase[size] = '\0';
     }
-    return result.success ? 0 : EHOSTUNREACH;
+    return 0;
   }
 
   int EXPORT

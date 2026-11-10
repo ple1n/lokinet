@@ -33,6 +33,17 @@ extern "C"
       const char* localAddr,
       struct lokinet_context* context);
 
+  /// wait for an outbound stream's target connection result; return 0 once resolved
+  int EXPORT
+  lokinet_stream_wait_ready(
+      int stream_id,
+      uint32_t timeout_ms,
+      int* success,
+      int* retryable,
+      char* phase,
+      size_t phase_capacity,
+      struct lokinet_context* context);
+
   /// stream accept filter determines if we should accept a stream or not
   /// return 0 to accept
   /// return -1 to explicitly reject
