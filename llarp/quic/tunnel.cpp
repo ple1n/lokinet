@@ -439,7 +439,8 @@ namespace llarp::quic
       if (it->second.open_cb)
       {
         auto on_open = std::exchange(it->second.open_cb, {});
-        const bool retryable = step_name == "network readiness" or step_name == "path build";
+        const bool retryable = step_name == "network readiness" or step_name == "path build"
+            or step_name == "endpoint ONS lookup";
         on_open({false, retryable, std::string{step_name}});
       }
       client_tunnels_.erase(it);
@@ -542,7 +543,9 @@ namespace llarp::quic
       // We were given an ONS address, so it's a two-step process: first we resolve the ONS name,
       // then we have to build a path to that address.
       auto loop = service_endpoint_.Loop();
-      const auto lookup_deadline = loop->time_now() + open_timeout;
+      const auto readiness_deadline = loop->time_now() + open_timeout;
+      const auto lookup_deadline = loop->time_now() + ons_lookup_timeout;
+      auto retry_delay = std::make_shared<std::chrono::milliseconds>(1000);
       auto retry_lookup = std::make_shared<std::function<void()>>();
       std::weak_ptr<std::function<void()>> weak_retry_lookup = retry_lookup;
       std::weak_ptr<int> weak_manager_lifetime = timer_keepalive_;
@@ -551,7 +554,10 @@ namespace llarp::quic
                        pport,
                        remote_addr,
                        after_path = std::move(after_path),
+                       readiness_deadline,
                        lookup_deadline,
+                       retry_delay,
+                       loop,
                        weak_retry_lookup]() {
         auto keep_alive = weak_retry_lookup.lock();
         if (not keep_alive or weak_manager_lifetime.expired()
@@ -560,13 +566,19 @@ namespace llarp::quic
 
         if (not service_endpoint_.ReadyForNameLookup())
         {
-          if (service_endpoint_.Loop()->time_now() >= lookup_deadline)
+          if (service_endpoint_.Loop()->time_now() >= readiness_deadline)
           {
             continue_connecting(pport, false, "network readiness", remote_addr);
             return;
           }
           service_endpoint_.Loop()->call_later(
               std::chrono::milliseconds{100}, [keep_alive] { (*keep_alive)(); });
+          return;
+        }
+
+        if (service_endpoint_.Loop()->time_now() >= lookup_deadline)
+        {
+          continue_connecting(pport, false, "endpoint ONS lookup", remote_addr);
           return;
         }
 
@@ -577,7 +589,10 @@ namespace llarp::quic
              pport,
              remote_addr,
              after_path,
+             readiness_deadline,
              lookup_deadline,
+             retry_delay,
+             loop,
              keep_alive](auto maybe_remote) {
               if (weak_manager_lifetime.expired())
                 return;
@@ -592,7 +607,7 @@ namespace llarp::quic
 
               if (not service_endpoint_.ReadyForNameLookup())
               {
-                if (service_endpoint_.Loop()->time_now() < lookup_deadline)
+                if (service_endpoint_.Loop()->time_now() < readiness_deadline)
                 {
                   service_endpoint_.Loop()->call_later(
                       std::chrono::milliseconds{100}, [keep_alive] { (*keep_alive)(); });
@@ -602,7 +617,21 @@ namespace llarp::quic
                 return;
               }
 
-              continue_connecting(pport, false, "endpoint ONS lookup", remote_addr);
+              if (service_endpoint_.Loop()->time_now() >= lookup_deadline)
+              {
+                continue_connecting(pport, false, "endpoint ONS lookup", remote_addr);
+                return;
+              }
+
+              const auto delay = *retry_delay;
+              *retry_delay = std::min(*retry_delay * 2, std::chrono::milliseconds{5000});
+              LogWarn(
+                  "ONS lookup for ",
+                  remote_addr,
+                  " returned no usable result; retrying in ",
+                  delay.count(),
+                  " ms");
+              loop->call_later(delay, [keep_alive] { (*keep_alive)(); });
             });
       };
       (*retry_lookup)();

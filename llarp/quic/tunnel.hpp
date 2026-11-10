@@ -52,9 +52,11 @@ namespace llarp::quic
         uint16_t port                   // The requested port the tunnel wants to reach
         )>;
 
-    // Timeout for the next `open()`.  Note that when `open()` is given a ONS name to resolve this
-    // includes the resolution time.
+    // Timeout for network readiness and path building.
     std::chrono::milliseconds open_timeout = 4s;
+
+    // ONS names are retried across multiple native lookup rounds for this long.
+    std::chrono::milliseconds ons_lookup_timeout = std::chrono::seconds{20};
 
     TunnelManager(EndpointBase& endpoint);
 
